@@ -5620,6 +5620,11 @@ const REDIRECT_ROWS = [
     const isFresh = state.folders.length === 1 && state.folders[0].id === UNCAT_ID
       && Object.keys(state.cardAssignments).length === 0
       && Object.keys(state.shortLinkAssignments).length === 0;
+    // Only seed folders + auto-bucket on a truly fresh state. Otherwise the
+    // user's renames or deletions would be undone on every page load (e.g.
+    // "404 Fixes" renamed to "404" would resurrect itself, because the
+    // embedded data still labels redirects with the original group_name).
+    if (!isFresh) return;
     const existingNames = new Set(state.folders.map(f => f.name));
     const groupNames = [...new Set(state.shortLinks.map(s => s.groupName).filter(Boolean))];
     groupNames.forEach(name => {
@@ -5628,21 +5633,16 @@ const REDIRECT_ROWS = [
         existingNames.add(name);
       }
     });
-    if (isFresh) {
-      // Auto-bucket "404 Fixes" on a fresh install
-      const fourOhFour = state.folders.find(f => f.name === '404 Fixes');
-      if (fourOhFour) {
-        state.shortLinks
-          .filter(sl => sl.groupName === '404 Fixes' && sl.cardId)
-          .forEach(sl => {
-            if (!state.cardAssignments[sl.cardId]) state.cardAssignments[sl.cardId] = fourOhFour.id;
-          });
-      }
-      saveState();
-    } else {
-      // even on non-fresh load, save any newly-seeded folders
-      saveState();
+    // Auto-bucket "404 Fixes" on a fresh install
+    const fourOhFour = state.folders.find(f => f.name === '404 Fixes');
+    if (fourOhFour) {
+      state.shortLinks
+        .filter(sl => sl.groupName === '404 Fixes' && sl.cardId)
+        .forEach(sl => {
+          if (!state.cardAssignments[sl.cardId]) state.cardAssignments[sl.cardId] = fourOhFour.id;
+        });
     }
+    saveState();
   }
 
   // ============ CARD ENRICHMENT ============
