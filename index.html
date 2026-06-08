@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>URL Preview — Pages We Forward To</title>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 <script>
 const REDIRECT_COLUMNS = ["id", "source_url", "target_url", "group_name", "http_code", "enabled"];
 const REDIRECT_ROWS = [
@@ -1913,6 +1914,12 @@ const REDIRECT_ROWS = [
   .gt-count { color:var(--muted); font-size:12px; }
   .gt-count strong { color:var(--text); }
 
+  /* Sync status indicator */
+  .sync-status { font-size:11px; color:var(--muted); padding:4px 8px; align-self:center; white-space:nowrap; letter-spacing:0.2px; }
+  .sync-status.error { color:var(--bad); }
+  .sync-status.ok { color:var(--accent); }
+  .toolbar-spacer { flex:1; }
+
   /* Toasts */
   #toasts { position:fixed; bottom:16px; right:16px; display:flex; flex-direction:column; gap:8px; z-index:1000; }
   .toast { background:var(--panel); border:1px solid var(--line); padding:10px 14px; border-radius:8px; font-size:12px; max-width:340px; box-shadow:0 4px 16px rgba(0,0,0,0.4); }
@@ -1930,7 +1937,9 @@ const REDIRECT_ROWS = [
     <div class="toolbar">
       <button class="btn btn-primary" id="exportBtn" title="Download an xlsx of id + new group_name to round-trip back to WordPress">Export xlsx</button>
       <button class="btn" id="addFolderBtn" title="Create a new top-level folder">+ Folder</button>
-      <button class="btn btn-ghost" id="resetBtn" title="Reset categorization (clears localStorage)">⟲</button>
+      <span class="toolbar-spacer"></span>
+      <span class="sync-status" id="syncStatus" title="Sync status with the shared Supabase backend">○ Connecting…</span>
+      <button class="btn btn-ghost" id="resetBtn" title="Reset categorization (clears local copy only — does not affect the shared state in Supabase)">⟲</button>
     </div>
     <div class="progress" id="progress">
       <span id="progressText">Loading…</span>
@@ -5308,6 +5317,7 @@ const REDIRECT_ROWS = [
   function saveState() {
     try { localStorage.setItem(STATE_KEY, JSON.stringify(state)); }
     catch (e) { toast('Could not save (localStorage full?)', 'error'); }
+    syncToSupabase();
   }
 
   // ============ HELPERS ============
@@ -5933,11 +5943,145 @@ const REDIRECT_ROWS = [
   const _origRenderTree = renderTree;
   renderTree = function() { _origRenderTree(); applyGalleryView(); };
 
+  // ============ SUPABASE SYNC ============
+  const SB_URL = 'https://qpsmsvogojwymqncojer.supabase.co';
+  const SB_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFwc21zdm9nb2p3eW1xbmNvamVyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMxNzA1MTYsImV4cCI6MjA4ODc0NjUxNn0.6qONVZMJGdqYOj3U9l-VZmz97yonXtxjGqFev7C80bg';
+  const LAST_SYNC_KEY = 'pwft.lastSyncedAt';
+  const sbClient = (window.supabase && typeof window.supabase.createClient === 'function')
+    ? window.supabase.createClient(SB_URL, SB_KEY)
+    : null;
+
+  const SESSION_ID = (() => {
+    try {
+      let s = sessionStorage.getItem('pwft.sessionId');
+      if (!s) { s = 's_' + Math.random().toString(36).slice(2, 12); sessionStorage.setItem('pwft.sessionId', s); }
+      return s;
+    } catch { return 's_' + Math.random().toString(36).slice(2, 12); }
+  })();
+
+  let suppressSync = false;
+  function setSyncStatus(s) {
+    const el = document.getElementById('syncStatus');
+    if (!el) return;
+    const M = {
+      connecting: ['○ Connecting…', ''],
+      syncing:    ['↻ Syncing…',    ''],
+      synced:     ['● Synced',      'ok'],
+      error:      ['✕ Sync error',  'error'],
+      offline:    ['○ Local only',  ''],
+    };
+    const m = M[s] || M.connecting;
+    el.textContent = m[0];
+    el.classList.remove('ok', 'error');
+    if (m[1]) el.classList.add(m[1]);
+  }
+
+  function syncStatePayload() {
+    return {
+      schemaVersion: state.schemaVersion,
+      folders: state.folders,
+      cardAssignments: state.cardAssignments,
+      shortLinkAssignments: state.shortLinkAssignments,
+    };
+  }
+
+  function applyRemoteState(payload) {
+    if (!payload || typeof payload !== 'object') return;
+    suppressSync = true;
+    try {
+      if (Array.isArray(payload.folders) && payload.folders.length) state.folders = payload.folders;
+      if (payload.cardAssignments && typeof payload.cardAssignments === 'object') state.cardAssignments = payload.cardAssignments;
+      if (payload.shortLinkAssignments && typeof payload.shortLinkAssignments === 'object') state.shortLinkAssignments = payload.shortLinkAssignments;
+      saveState();
+    } finally {
+      suppressSync = false;
+    }
+    enrichCardsFooters();
+    renderTree();
+  }
+
+  let syncDebounceTimer = null;
+  function syncToSupabase() {
+    if (!sbClient || suppressSync) return;
+    setSyncStatus('syncing');
+    clearTimeout(syncDebounceTimer);
+    syncDebounceTimer = setTimeout(async () => {
+      try {
+        const now = new Date().toISOString();
+        const { error } = await sbClient
+          .from('categorization_state')
+          .upsert({
+            id: 1,
+            state: syncStatePayload(),
+            updated_by_session: SESSION_ID,
+            updated_at: now,
+          }, { onConflict: 'id' });
+        if (error) throw error;
+        try { localStorage.setItem(LAST_SYNC_KEY, now); } catch {}
+        setSyncStatus('synced');
+      } catch (err) {
+        console.error('Supabase sync failed:', err);
+        setSyncStatus('error');
+      }
+    }, 1500);
+  }
+
+  async function initialLoadFromSupabase() {
+    if (!sbClient) { setSyncStatus('offline'); return; }
+    setSyncStatus('connecting');
+    try {
+      const { data, error } = await sbClient
+        .from('categorization_state')
+        .select('state, updated_by_session, updated_at')
+        .eq('id', 1)
+        .maybeSingle();
+      if (error) throw error;
+      const remoteHasContent = data && data.state && Array.isArray(data.state.folders) && data.state.folders.length > 1;
+      const localHasContent = state.folders.length > 1
+        || Object.keys(state.cardAssignments).length > 0
+        || Object.keys(state.shortLinkAssignments).length > 0;
+      if (remoteHasContent) {
+        applyRemoteState(data.state);
+        try { localStorage.setItem(LAST_SYNC_KEY, data.updated_at); } catch {}
+        setSyncStatus('synced');
+      } else if (localHasContent) {
+        // First push: send our local state to seed the shared backend
+        syncToSupabase();
+      } else {
+        setSyncStatus('synced');
+      }
+    } catch (err) {
+      console.error('Initial Supabase load failed:', err);
+      setSyncStatus('error');
+      toast('Could not connect to sync server. Working locally — changes won\'t propagate until reconnected.', 'error');
+    }
+  }
+
+  function subscribeToRemoteChanges() {
+    if (!sbClient) return;
+    sbClient
+      .channel('cat_state_changes')
+      .on('postgres_changes',
+        { event: '*', schema: 'public', table: 'categorization_state' },
+        (payload) => {
+          const newRow = payload.new;
+          if (!newRow || newRow.updated_by_session === SESSION_ID) return;
+          if (newRow.state) {
+            applyRemoteState(newRow.state);
+            try { localStorage.setItem(LAST_SYNC_KEY, newRow.updated_at); } catch {}
+            toast('Synced changes from another teammate', 'ok');
+          }
+        })
+      .subscribe();
+  }
+
   // ============ INIT ============
   state.shortLinks = hydrateShortLinksFromEmbedded();
   seedFoldersFromGroupsIfFresh();
   enrichCardsFooters();
   renderTree();
+  setSyncStatus('connecting');
+  initialLoadFromSupabase().then(() => subscribeToRemoteChanges());
 })();
 </script>
 </body>
