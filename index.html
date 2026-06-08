@@ -5297,28 +5297,113 @@ const REDIRECT_ROWS = [
   // ============ STATE ============
   function defaultState() {
     return {
-      schemaVersion: 3,
+      schemaVersion: 4,
       folders: [
         { id: UNCAT_ID, name: 'Uncategorized', parentId: null, expanded: true },
       ],
       cardAssignments: {},
       shortLinkAssignments: {},
+      // v4: per-key timestamps + deletion tombstones enable non-destructive
+      // last-writer-wins merging of the Supabase shared state with local edits,
+      // so concurrent categorizers never overwrite each other's work.
+      ts: { card: {}, sl: {}, folder: { [UNCAT_ID]: 0 } },
+      tombstones: { card: {}, sl: {}, folder: {} },
+      clientId: 'c-' + Math.random().toString(36).slice(2, 10),
     };
   }
+
+  // Coerce any stored/remote object into a valid v4 state, migrating v3 in place
+  // (stamping existing assignments so they have a real baseline timestamp).
+  function normalizeState(s) {
+    if (!s || typeof s !== 'object') return defaultState();
+    s.folders = Array.isArray(s.folders) ? s.folders : [];
+    s.cardAssignments = s.cardAssignments || {};
+    s.shortLinkAssignments = s.shortLinkAssignments || {};
+    s.ts = s.ts || {}; s.ts.card = s.ts.card || {}; s.ts.sl = s.ts.sl || {}; s.ts.folder = s.ts.folder || {};
+    s.tombstones = s.tombstones || {}; s.tombstones.card = s.tombstones.card || {}; s.tombstones.sl = s.tombstones.sl || {}; s.tombstones.folder = s.tombstones.folder || {};
+    if (s.schemaVersion !== 4) {
+      const t = Date.now();
+      Object.keys(s.cardAssignments).forEach(k => { if (s.ts.card[k] == null) s.ts.card[k] = t; });
+      Object.keys(s.shortLinkAssignments).forEach(k => { if (s.ts.sl[k] == null) s.ts.sl[k] = t; });
+      s.folders.forEach(f => { if (s.ts.folder[f.id] == null) s.ts.folder[f.id] = (f.id === UNCAT_ID ? 0 : t); });
+    }
+    if (!s.folders.some(f => f.id === UNCAT_ID)) {
+      s.folders.unshift({ id: UNCAT_ID, name: 'Uncategorized', parentId: null, expanded: true });
+      s.ts.folder[UNCAT_ID] = 0;
+    }
+    s.clientId = s.clientId || ('c-' + Math.random().toString(36).slice(2, 10));
+    s.schemaVersion = 4;
+    return s;
+  }
+
+  // Non-destructive merge of two v4 states. Per key, the newest timestamp wins;
+  // a deletion tombstone wins if newer than any value. Pure function — kept in
+  // sync with merge-states.mjs.
+  function mergeStates(a, b) {
+    a = normalizeState(a); b = normalizeState(b);
+    const out = {
+      schemaVersion: 4, folders: [], cardAssignments: {}, shortLinkAssignments: {},
+      ts: { card: {}, sl: {}, folder: {} }, tombstones: { card: {}, sl: {}, folder: {} },
+      clientId: a.clientId || b.clientId,
+    };
+    const fWin = {};
+    [a, b].forEach(s => s.folders.forEach(f => {
+      const ts = s.ts.folder[f.id] ?? 0;
+      if (!fWin[f.id] || ts >= fWin[f.id]._ts) fWin[f.id] = { ...f, _ts: ts };
+    }));
+    const folderIds = new Set([...Object.keys(fWin), ...Object.keys(a.tombstones.folder), ...Object.keys(b.tombstones.folder)]);
+    folderIds.forEach(id => {
+      const delTs = Math.max(a.tombstones.folder[id] ?? -1, b.tombstones.folder[id] ?? -1);
+      const liveTs = fWin[id] ? fWin[id]._ts : -1;
+      if (id !== UNCAT_ID && delTs > liveTs) { out.tombstones.folder[id] = delTs; }
+      else if (fWin[id]) { const { _ts, ...folder } = fWin[id]; out.folders.push(folder); out.ts.folder[id] = _ts; }
+    });
+    if (!out.folders.some(f => f.id === UNCAT_ID)) { out.folders.unshift({ id: UNCAT_ID, name: 'Uncategorized', parentId: null, expanded: true }); out.ts.folder[UNCAT_ID] = 0; }
+    const mergeMap = (field, kind) => {
+      const keys = new Set([...Object.keys(a[field]), ...Object.keys(b[field]), ...Object.keys(a.tombstones[kind]), ...Object.keys(b.tombstones[kind])]);
+      keys.forEach(k => {
+        let best = { kind: 'none', ts: -1, val: null };
+        if (a[field][k] != null) { const ts = a.ts[kind][k] ?? 0; if (ts > best.ts) best = { kind: 'val', ts, val: a[field][k] }; }
+        if (b[field][k] != null) { const ts = b.ts[kind][k] ?? 0; if (ts > best.ts) best = { kind: 'val', ts, val: b[field][k] }; }
+        const aDel = a.tombstones[kind][k] ?? -1, bDel = b.tombstones[kind][k] ?? -1;
+        if (aDel > best.ts) best = { kind: 'tomb', ts: aDel };
+        if (bDel > best.ts) best = { kind: 'tomb', ts: bDel };
+        if (best.kind === 'val') { out[field][k] = best.val; out.ts[kind][k] = best.ts; }
+        else if (best.kind === 'tomb') { out.tombstones[kind][k] = best.ts; }
+      });
+    };
+    mergeMap('cardAssignments', 'card');
+    mergeMap('shortLinkAssignments', 'sl');
+    const liveFolder = new Set(out.folders.map(f => f.id));
+    Object.keys(out.cardAssignments).forEach(k => { if (!liveFolder.has(out.cardAssignments[k])) out.cardAssignments[k] = UNCAT_ID; });
+    Object.keys(out.shortLinkAssignments).forEach(k => { if (!liveFolder.has(out.shortLinkAssignments[k])) delete out.shortLinkAssignments[k]; });
+    return out;
+  }
+
   let state;
   try {
     const s = localStorage.getItem(STATE_KEY);
-    state = s ? JSON.parse(s) : defaultState();
-    if (state.schemaVersion !== 3) state = defaultState();
+    state = s ? normalizeState(JSON.parse(s)) : defaultState();
   } catch (e) { state = defaultState(); }
   // shortLinks always live in memory only (re-hydrated from the embedded data each load)
   state.shortLinks = [];
 
+  // state without the in-memory shortLinks (those are re-hydrated from embedded data)
+  function serializableState() { const { shortLinks, ...rest } = state; return rest; }
   function saveState() {
-    try { localStorage.setItem(STATE_KEY, JSON.stringify(state)); }
+    try { localStorage.setItem(STATE_KEY, JSON.stringify(serializableState())); }
     catch (e) { toast('Could not save (localStorage full?)', 'error'); }
     syncToSupabase();
   }
+
+  // ===== timestamped mutation helpers (so edits merge non-destructively) =====
+  function touch(kind, key) { state.ts[kind][key] = Date.now(); delete state.tombstones[kind][key]; }
+  function tomb(kind, key) { state.tombstones[kind][key] = Date.now(); }
+  function assignCard(cardId, folderId) { state.cardAssignments[cardId] = folderId; touch('card', cardId); }
+  function setOverride(id, folderId) { state.shortLinkAssignments[id] = folderId; touch('sl', id); }
+  function clearOverride(id) { delete state.shortLinkAssignments[id]; tomb('sl', id); }
+  function touchFolder(id) { touch('folder', id); }
+  function tombFolder(id) { delete state.ts.folder[id]; tomb('folder', id); }
 
   // ============ HELPERS ============
   function uid() { return 'f-' + Math.random().toString(36).slice(2, 10); }
@@ -5362,10 +5447,10 @@ const REDIRECT_ROWS = [
   }
   function reassignOnDelete(deletedFolderId, fallbackId) {
     Object.keys(state.cardAssignments).forEach(k => {
-      if (state.cardAssignments[k] === deletedFolderId) state.cardAssignments[k] = fallbackId;
+      if (state.cardAssignments[k] === deletedFolderId) assignCard(k, fallbackId);
     });
     Object.keys(state.shortLinkAssignments).forEach(k => {
-      if (state.shortLinkAssignments[k] === deletedFolderId) state.shortLinkAssignments[k] = fallbackId;
+      if (state.shortLinkAssignments[k] === deletedFolderId) setOverride(k, fallbackId);
     });
   }
 
@@ -5504,7 +5589,9 @@ const REDIRECT_ROWS = [
   function createFolder(parentId) {
     const name = (prompt('New folder name:') || '').trim();
     if (!name) return;
-    state.folders.push({ id: uid(), name, parentId, expanded: true });
+    const nid = uid();
+    state.folders.push({ id: nid, name, parentId, expanded: true });
+    touchFolder(nid);
     if (parentId) { const p = folderById(parentId); if (p) p.expanded = true; }
     saveState();
     renderTree();
@@ -5520,7 +5607,7 @@ const REDIRECT_ROWS = [
     let done = false;
     const finish = (commit) => {
       if (done) return; done = true;
-      if (commit && input.value.trim()) folder.name = input.value.trim();
+      if (commit && input.value.trim() && folder.name !== input.value.trim()) { folder.name = input.value.trim(); touchFolder(folder.id); }
       saveState();
       renderTree();
     };
@@ -5545,6 +5632,7 @@ const REDIRECT_ROWS = [
     }
     toDelete.forEach(fid => reassignOnDelete(fid, UNCAT_ID));
     state.folders = state.folders.filter(f => !toDelete.has(f.id));
+    toDelete.forEach(fid => { if (fid !== UNCAT_ID) tombFolder(fid); });
     saveState();
     renderTree();
     enrichCardsFooters();
@@ -5603,14 +5691,14 @@ const REDIRECT_ROWS = [
     e.preventDefault();
     const folderId = row.dataset.folderId;
     if (dragPayload.type === 'card') {
-      state.cardAssignments[dragPayload.cardId] = folderId;
+      assignCard(dragPayload.cardId, folderId);
       state.shortLinks.filter(sl => sl.cardId === dragPayload.cardId)
-        .forEach(sl => { delete state.shortLinkAssignments[sl.id]; });
+        .forEach(sl => { if (state.shortLinkAssignments[sl.id] != null) clearOverride(sl.id); });
     } else if (dragPayload.type === 'shortlink') {
-      state.shortLinkAssignments[dragPayload.id] = folderId;
+      setOverride(dragPayload.id, folderId);
     } else if (dragPayload.type === 'folder') {
       const f = folderById(dragPayload.id);
-      if (f && !isDescendantOrSelf(folderId, f.id)) f.parentId = folderId;
+      if (f && !isDescendantOrSelf(folderId, f.id)) { f.parentId = folderId; touchFolder(f.id); }
     }
     saveState();
     renderTree();
@@ -5639,7 +5727,9 @@ const REDIRECT_ROWS = [
     const groupNames = [...new Set(state.shortLinks.map(s => s.groupName).filter(Boolean))];
     groupNames.forEach(name => {
       if (!existingNames.has(name)) {
-        state.folders.push({ id: uid(), name, parentId: null, expanded: false });
+        const nid = uid();
+        state.folders.push({ id: nid, name, parentId: null, expanded: false });
+        state.ts.folder[nid] = Date.now();
         existingNames.add(name);
       }
     });
@@ -5649,7 +5739,7 @@ const REDIRECT_ROWS = [
       state.shortLinks
         .filter(sl => sl.groupName === '404 Fixes' && sl.cardId)
         .forEach(sl => {
-          if (!state.cardAssignments[sl.cardId]) state.cardAssignments[sl.cardId] = fourOhFour.id;
+          if (!state.cardAssignments[sl.cardId]) assignCard(sl.cardId, fourOhFour.id);
         });
     }
     saveState();
@@ -5977,27 +6067,53 @@ const REDIRECT_ROWS = [
   }
 
   function syncStatePayload() {
+    // include ts + tombstones so the shared state merges non-destructively
     return {
       schemaVersion: state.schemaVersion,
       folders: state.folders,
       cardAssignments: state.cardAssignments,
       shortLinkAssignments: state.shortLinkAssignments,
+      ts: state.ts,
+      tombstones: state.tombstones,
     };
   }
 
+  // value-only signature (ignores timestamps) so convergence stops the sync loop
+  function valueSig(s) {
+    return JSON.stringify({
+      f: (s.folders || []).map(f => [f.id, f.name, f.parentId ?? null]).sort(),
+      c: s.cardAssignments || {},
+      l: s.shortLinkAssignments || {},
+      t: {
+        c: Object.keys(s.tombstones?.card || {}).sort(),
+        f: Object.keys(s.tombstones?.folder || {}).sort(),
+        l: Object.keys(s.tombstones?.sl || {}).sort(),
+      },
+    });
+  }
+
+  // Merge the incoming shared state with local (LWW per key) instead of
+  // overwriting — so a teammate's update can never clobber your work and an
+  // older/partial remote can never wipe a richer local state.
   function applyRemoteState(payload) {
     if (!payload || typeof payload !== 'object') return;
+    const incoming = normalizeState(JSON.parse(JSON.stringify(payload)));
+    const incomingSig = valueSig(incoming);
     suppressSync = true;
     try {
-      if (Array.isArray(payload.folders) && payload.folders.length) state.folders = payload.folders;
-      if (payload.cardAssignments && typeof payload.cardAssignments === 'object') state.cardAssignments = payload.cardAssignments;
-      if (payload.shortLinkAssignments && typeof payload.shortLinkAssignments === 'object') state.shortLinkAssignments = payload.shortLinkAssignments;
+      state = mergeStates(state, incoming);
+      state.shortLinks = hydrateShortLinksFromEmbedded();
       saveState();
     } finally {
       suppressSync = false;
     }
     enrichCardsFooters();
     renderTree();
+    if (typeof updateProgress === 'function') updateProgress();
+    // If the merge produced anything the sender didn't have (our newer/extra
+    // work), push the union back so it propagates. Converges (no loop) because
+    // once both sides match by value, the signatures are equal.
+    if (valueSig(state) !== incomingSig) syncToSupabase();
   }
 
   let syncDebounceTimer = null;
@@ -6077,11 +6193,19 @@ const REDIRECT_ROWS = [
 
   // ============ INIT ============
   state.shortLinks = hydrateShortLinksFromEmbedded();
-  seedFoldersFromGroupsIfFresh();
   enrichCardsFooters();
   renderTree();
   setSyncStatus('connecting');
-  initialLoadFromSupabase().then(() => subscribeToRemoteChanges());
+  // Seed the group-name scaffolding only AFTER merging the shared state, and
+  // only if still fresh — otherwise merging remote (which already has those
+  // folders, by their own ids) with freshly-seeded folders would duplicate them.
+  initialLoadFromSupabase().then(() => {
+    seedFoldersFromGroupsIfFresh();
+    enrichCardsFooters();
+    renderTree();
+    updateProgress();
+    subscribeToRemoteChanges();
+  });
 })();
 </script>
 </body>
