@@ -6123,7 +6123,6 @@ const REDIRECT_ROWS = [
   function applyRemoteState(payload) {
     if (!payload || typeof payload !== 'object') return;
     const incoming = normalizeState(JSON.parse(JSON.stringify(payload)));
-    const incomingSig = valueSig(incoming);
     suppressSync = true;
     try {
       state = mergeStates(state, incoming);
@@ -6135,10 +6134,12 @@ const REDIRECT_ROWS = [
     enrichCardsFooters();
     renderTree();
     if (typeof updateProgress === 'function') updateProgress();
-    // If the merge produced anything the sender didn't have (our newer/extra
-    // work), push the union back so it propagates. Converges (no loop) because
-    // once both sides match by value, the signatures are equal.
-    if (valueSig(state) !== incomingSig) syncToSupabase();
+    // NOTE: we deliberately do NOT auto re-upload the merged result here.
+    // Re-syncing on every received update created a feedback loop between two
+    // open sessions (each merge + folder-dedup produced a slightly different
+    // signature, so they ping-ponged forever). The merge-on-receive already
+    // prevents data loss; any local-only work propagates on the user's next
+    // edit and re-merges on load — no loop.
   }
 
   let syncDebounceTimer = null;
