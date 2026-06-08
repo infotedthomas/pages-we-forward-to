@@ -85,7 +85,29 @@ function mergeStates(a, b) {
   const liveFolder = new Set(out.folders.map(f => f.id));
   Object.keys(out.cardAssignments).forEach(k => { if (!liveFolder.has(out.cardAssignments[k])) out.cardAssignments[k] = UNCAT_ID; });
   Object.keys(out.shortLinkAssignments).forEach(k => { if (!liveFolder.has(out.shortLinkAssignments[k])) delete out.shortLinkAssignments[k]; });
-  return out;
+  return dedupeFoldersByName(out);
+}
+
+// Collapse folders sharing a name + parent onto one surviving copy (remap
+// assignments, tombstone the extras). Keep in sync with index.html.
+function dedupeFoldersByName(s) {
+  const groups = {};
+  s.folders.forEach(f => { const k = JSON.stringify([f.parentId ?? null, f.name]); (groups[k] = groups[k] || []).push(f); });
+  const refs = id => Object.values(s.cardAssignments).filter(v => v === id).length + Object.values(s.shortLinkAssignments).filter(v => v === id).length;
+  const remap = {};
+  Object.values(groups).forEach(g => {
+    if (g.length < 2) return;
+    g.sort((a, b) => refs(b.id) - refs(a.id) || String(a.id).localeCompare(String(b.id)));
+    g.slice(1).forEach(d => { if (d.id !== UNCAT_ID) remap[d.id] = g[0].id; });
+  });
+  const dupIds = Object.keys(remap);
+  if (!dupIds.length) return s;
+  const now = Date.now();
+  for (const c in s.cardAssignments) if (remap[s.cardAssignments[c]]) { s.cardAssignments[c] = remap[s.cardAssignments[c]]; s.ts.card[c] = now; }
+  for (const l in s.shortLinkAssignments) if (remap[s.shortLinkAssignments[l]]) { s.shortLinkAssignments[l] = remap[s.shortLinkAssignments[l]]; s.ts.sl[l] = now; }
+  s.folders = s.folders.filter(f => !remap[f.id]);
+  dupIds.forEach(id => { s.tombstones.folder[id] = now; delete s.ts.folder[id]; });
+  return s;
 }
 
 export { mergeStates, normalizeState, defaultState };

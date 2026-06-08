@@ -5377,13 +5377,38 @@ const REDIRECT_ROWS = [
     const liveFolder = new Set(out.folders.map(f => f.id));
     Object.keys(out.cardAssignments).forEach(k => { if (!liveFolder.has(out.cardAssignments[k])) out.cardAssignments[k] = UNCAT_ID; });
     Object.keys(out.shortLinkAssignments).forEach(k => { if (!liveFolder.has(out.shortLinkAssignments[k])) delete out.shortLinkAssignments[k]; });
-    return out;
+    return dedupeFoldersByName(out);
+  }
+
+  // Collapse folders that share a name + parent. These arise when two browsers
+  // seed the same group independently and each gets a different random id;
+  // merging by id would otherwise keep both. Cards/overrides are remapped onto
+  // the surviving copy (the one with the most items) and the extras tombstoned.
+  // Runs on every load and every merge, so duplicates can never accumulate.
+  function dedupeFoldersByName(s) {
+    const groups = {};
+    s.folders.forEach(f => { const k = JSON.stringify([f.parentId ?? null, f.name]); (groups[k] = groups[k] || []).push(f); });
+    const refs = id => Object.values(s.cardAssignments).filter(v => v === id).length + Object.values(s.shortLinkAssignments).filter(v => v === id).length;
+    const remap = {};
+    Object.values(groups).forEach(g => {
+      if (g.length < 2) return;
+      g.sort((a, b) => refs(b.id) - refs(a.id) || String(a.id).localeCompare(String(b.id)));
+      g.slice(1).forEach(d => { if (d.id !== UNCAT_ID) remap[d.id] = g[0].id; });
+    });
+    const dupIds = Object.keys(remap);
+    if (!dupIds.length) return s;
+    const now = Date.now();
+    for (const c in s.cardAssignments) if (remap[s.cardAssignments[c]]) { s.cardAssignments[c] = remap[s.cardAssignments[c]]; s.ts.card[c] = now; }
+    for (const l in s.shortLinkAssignments) if (remap[s.shortLinkAssignments[l]]) { s.shortLinkAssignments[l] = remap[s.shortLinkAssignments[l]]; s.ts.sl[l] = now; }
+    s.folders = s.folders.filter(f => !remap[f.id]);
+    dupIds.forEach(id => { s.tombstones.folder[id] = now; delete s.ts.folder[id]; });
+    return s;
   }
 
   let state;
   try {
     const s = localStorage.getItem(STATE_KEY);
-    state = s ? normalizeState(JSON.parse(s)) : defaultState();
+    state = s ? dedupeFoldersByName(normalizeState(JSON.parse(s))) : defaultState();
   } catch (e) { state = defaultState(); }
   // shortLinks always live in memory only (re-hydrated from the embedded data each load)
   state.shortLinks = [];
