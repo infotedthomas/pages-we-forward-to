@@ -5861,6 +5861,17 @@ const REDIRECT_ROWS = [
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(groupsRows, {
       header: ['group_name', 'redirect_count_in_export'],
     }), 'Groups');
+    // Pages sheet: a clean one-row-per-captured-page list (category + URL),
+    // sorted by category — i.e. exactly the 469 cards you filed, deduped.
+    const pageRows = cards
+      .map(c => ({
+        category: folderName(state.cardAssignments[c.cardId] || UNCAT_ID) || 'Uncategorized',
+        page_url: c.url,
+      }))
+      .sort((a, b) => a.category.localeCompare(b.category) || a.page_url.localeCompare(b.page_url));
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(pageRows, {
+      header: ['category', 'page_url'],
+    }), 'Pages');
     const out = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
     const blob = new Blob([out], { type: 'application/octet-stream' });
     const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
@@ -5870,7 +5881,7 @@ const REDIRECT_ROWS = [
     a.download = fname;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 2000);
-    toast(`Exported ${rows.length} redirects → ${fname}`, 'ok');
+    toast(`Exported ${rows.length} redirects + ${pageRows.length} pages → ${fname}`, 'ok');
   });
 
   // ============ TOOLBAR ============
