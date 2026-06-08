@@ -5823,6 +5823,7 @@ const REDIRECT_ROWS = [
     if (typeof XLSX === 'undefined') { toast('XLSX library failed to load.', 'error'); return; }
     if (state.shortLinks.length === 0) { toast('No redirect data loaded.', 'error'); return; }
     const folderName = (id) => folderById(id)?.name || '';
+    const cardUrlById = new Map(cards.map(c => [c.cardId, c.url]));
     const rows = state.shortLinks.map(sl => {
       const overrideId = state.shortLinkAssignments[sl.id];
       const cardFolderId = sl.cardId ? state.cardAssignments[sl.cardId] : null;
@@ -5830,9 +5831,16 @@ const REDIRECT_ROWS = [
       const newGroupName = (finalFolderId && finalFolderId !== UNCAT_ID)
         ? folderName(finalFolderId)
         : (sl.groupName || '');
+      // where the group_name came from: a per-redirect override, the target
+      // page's (card's) folder, or the original WordPress group (passthrough)
+      const groupSource = (overrideId && overrideId !== UNCAT_ID) ? 'override'
+        : (cardFolderId && cardFolderId !== UNCAT_ID) ? 'card'
+        : 'original';
       return {
         id: Number(sl.id) || sl.id,
         group_name: newGroupName,
+        group_source: groupSource,
+        captured_page: sl.cardId ? (cardUrlById.get(sl.cardId) || '') : '',
         source_url: sl.sourceUrl,
         target_url: sl.targetUrl,
         http_code: sl.httpCode,
@@ -5841,7 +5849,7 @@ const REDIRECT_ROWS = [
     });
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows, {
-      header: ['id', 'group_name', 'source_url', 'target_url', 'http_code', 'enabled'],
+      header: ['id', 'group_name', 'group_source', 'captured_page', 'source_url', 'target_url', 'http_code', 'enabled'],
     }), 'Redirects');
     // Groups sheet: rebuilt from final group_name counts
     const groupCounts = {};
